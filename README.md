@@ -82,6 +82,31 @@ git fetch upstream && git switch main && git merge upstream/main && git push ori
 Ou **Sync fork → Update branch** na página do seu fork. Faça isso no início de
 **toda** atividade.
 
+## DevSecOps (Atividade 8)
+
+Todo PR e todo push na `main` passam pelo workflow
+[`devsecops.yml`](.github/workflows/devsecops.yml):
+
+| Ferramenta | Verifica | Bloqueia quando |
+| --- | --- | --- |
+| ruff + pytest | Lint, testes e cobertura | Lint ou teste falha |
+| Gitleaks | Segredos em todo o histórico do Git | Qualquer segredo encontrado |
+| SonarCloud | SAST e qualidade do código novo | Quality Gate reprova |
+| Trivy | CVEs das dependências e da imagem Docker | CRITICAL/HIGH com correção disponível |
+| Syft | SBOM da imagem (SPDX JSON, artefato do run) | Não consegue gerar |
+
+LOW/MEDIUM do Trivy só viram relatório (artefato `trivy-relatorios`). A imagem
+só é publicada no GHCR em push na `main`, depois de todos os checks passarem.
+Detalhes, artefatos e a demonstração de bloqueio e correção em
+**[docs/devsecops.md](docs/devsecops.md)**.
+
+Imagem local:
+
+```bash
+docker build -t ufla-shop:1.0 .
+docker run -d --name loja -p 8000:8000 ufla-shop:1.0   # http://localhost:8000
+```
+
 ## `scripts/check-ambiente.sh`
 
 Verifica ferramentas, versões mínimas, o daemon do Docker, a configuração do Git
