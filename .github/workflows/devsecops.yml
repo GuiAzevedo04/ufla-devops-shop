@@ -1,0 +1,204 @@
+name: DevSecOps
+
+# Roda em todo PR (abertura e cada novo push) e em todo push na main.
+# A imagem so e publicada no GHCR em push na main E se todos os checks passarem.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+# Menor privilegio: por padrao os jobs so leem o repositorio.
+permissions:
+  contents: read
+
+env:
+  IMAGE_LOCAL: ufla-devops-shop:ci
+  IMAGE_GHCR: ghcr.io/guiazevedo04/ufla-devops-shop
+
+jobs:
+  # ---------------------------------------------------------------- build/teste
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Testes com cobertura (pytest)
+        run: pytest --cov=app --cov-report=xml --cov-report=term
+
+      # O SonarCloud usa este arquivo para medir a cobertura do codigo novo.
+      - name: Guardar coverage.xml
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.xml
+
+  # ---------------------------------------------------------------- segredos
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # historico completo, nao so o ultimo commit
+
+      - name: Instalar Gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar xz gitleaks
+          ./gitleaks version
+
+      # "gitleaks git" varre TODOS os commits do historico.
+      # --exit-code 1: qualquer segredo encontrado reprova o job (bloqueante).
+      # --redact: nunca imprime o segredo no log.
+      - name: Varrer o historico com Gitleaks
+        run: ./gitleaks git --redact --verbose --exit-code 1 .
+
+  # ---------------------------------------------------------------- SAST
+  sonarcloud:
+    name: sonarcloud
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # o Sonar precisa do historico para saber o que e "codigo novo"
+
+      - name: Baixar coverage.xml do job test
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage
+
+      # Configuracao em sonar-project.properties. Com sonar.qualitygate.wait=true
+      # o passo espera o Quality Gate e FALHA se ele reprovar.
+      - name: Analise SonarCloud + Quality Gate
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ---------------------------------------------------------------- dependencias e imagem
+  trivy:
+    name: trivy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # 1) Dependencias (requirements*.txt) -- BLOQUEANTE
+      - name: Trivy fs - CRITICAL/HIGH com correcao (bloqueia)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      # 2) Construir a imagem para escanear
+      - name: Build da imagem
+        run: docker build -t "$IMAGE_LOCAL" .
+
+      # 3) Imagem (pacotes do SO + Python) -- BLOQUEANTE
+      - name: Trivy image - CRITICAL/HIGH com correcao (bloqueia)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_LOCAL }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      # 4) Relatorios LOW/MEDIUM -- apenas registram, NUNCA reprovam (exit-code 0)
+      - name: Trivy fs - relatorio LOW/MEDIUM (nao bloqueia)
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: LOW,MEDIUM
+          exit-code: "0"
+          format: table
+          output: trivy-fs-low-medium.txt
+
+      - name: Trivy image - relatorio LOW/MEDIUM (nao bloqueia)
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_LOCAL }}
+          severity: LOW,MEDIUM
+          exit-code: "0"
+          format: table
+          output: trivy-image-low-medium.txt
+
+      - name: Publicar relatorios do Trivy
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trivy-relatorios
+          path: trivy-*.txt
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- SBOM
+  sbom:
+    name: sbom
+    needs: trivy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build da imagem
+        run: docker build -t "$IMAGE_LOCAL" .
+
+      # Syft lista todos os componentes da imagem (SO + Python) com versoes.
+      # O arquivo e publicado como artefato do run.
+      - name: Gerar SBOM da imagem (Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE_LOCAL }}
+          format: spdx-json
+          output-file: sbom-ufla-devops-shop.spdx.json
+          artifact-name: sbom-ufla-devops-shop.spdx.json
+
+  # ---------------------------------------------------------------- publicacao
+  publish:
+    name: publish
+    # So depois de TODOS os checks obrigatorios passarem...
+    needs: [test, gitleaks, sonarcloud, trivy, sbom]
+    # ...e so em push na main (nunca em PR).
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # unico job que pode escrever no GHCR
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Login no GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build e push (sha curto + latest)
+        run: |
+          SHA_CURTO="${GITHUB_SHA::7}"
+          docker build -t "$IMAGE_GHCR:$SHA_CURTO" -t "$IMAGE_GHCR:latest" .
+          docker push "$IMAGE_GHCR:$SHA_CURTO"
+          docker push "$IMAGE_GHCR:latest"
