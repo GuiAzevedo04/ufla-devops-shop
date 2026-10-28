@@ -1,0 +1,25 @@
+# Nada disto deve entrar na imagem
+.git
+.github
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.coverage
+coverage.xml
+tests
+*.db
+*.db-journal
+.env
+.env.*
+dados
+analises
+alunos
+docs
+scripts
+*.md
+Dockerfile
+.dockerignore
+sonar-project.properties
